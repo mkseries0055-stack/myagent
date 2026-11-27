@@ -19,14 +19,17 @@ class AgentService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.example.myagent.STOP"
+        const val EXTRA_TASK = "task"
         private const val CHANNEL = "agent_running"
         private const val NOTIF_ID = 11
 
         @Volatile
         var running = false
 
-        fun start(ctx: Context) {
-            ContextCompat.startForegroundService(ctx, Intent(ctx, AgentService::class.java))
+        fun start(ctx: Context, task: String? = null) {
+            val i = Intent(ctx, AgentService::class.java)
+            if (task != null) i.putExtra(EXTRA_TASK, task)
+            ContextCompat.startForegroundService(ctx, i)
         }
 
         fun stop(ctx: Context) {
@@ -82,11 +85,15 @@ class AgentService : Service() {
             return START_NOT_STICKY
         }
         if (overlay == null) {
-            val o = OverlayController(this)
+            val o = OverlayController(this) { stopSelf() }
             o.start()
             overlay = o
         }
         running = true
+
+        val task = intent?.getStringExtra(EXTRA_TASK)
+        if (!task.isNullOrBlank()) overlay?.runTask(task)
+
         return START_STICKY
     }
 
