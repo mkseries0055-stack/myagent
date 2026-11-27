@@ -9,6 +9,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -50,7 +51,10 @@ private class MaxHeightScroll(ctx: Context, private val maxH: Int) : ScrollView(
     }
 }
 
-class OverlayController(private val ctx: Context) {
+class OverlayController(
+    private val ctx: Context,
+    private val onCloseRequest: () -> Unit
+) {
     private val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
     private val main = Handler(Looper.getMainLooper())
@@ -65,11 +69,14 @@ class OverlayController(private val ctx: Context) {
     private var root: BubbleRoot? = null
     private var bubbleAdded = false
     private var thinkPill: View? = null
+    private var closePill: View? = null
+    private var closeHide: Runnable? = null
+    private var longRun: Runnable? = null
 
     private var mode = 0 // 0 = বন্ধ, 1 = শুধু উত্তর, 2 = লেখার ঘরসহ
     private var thinking = false
     private var alive = false
-    private var lastAnswer = ""
+    private var longFired = false
     private var lastOutsideClose = 0L
 
     private var dX = 0f
@@ -100,25 +107,31 @@ class OverlayController(private val ctx: Context) {
         lp.x = screenW - orbSize - dp(6)
         lp.y = (screenH * 0.35f).toInt()
 
-        o.setOnTouchListener { _, e ->
+        o.setOnTouchListener { v, e ->
             val p = orbLp
             if (p == null) {
                 false
             } else {
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
+                        hideClosePill()
                         dX = e.rawX
                         dY = e.rawY
                         sX = p.x
                         sY = p.y
                         moved = false
+                        longFired = false
+                        scheduleLong(v)
                         true
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dx = e.rawX - dX
                         val dy = e.rawY - dY
-                        if (abs(dx) > dp(8) || abs(dy) > dp(8)) moved = true
-                        if (moved) {
+                        if (abs(dx) > dp(8) || abs(dy) > dp(8)) {
+                            moved = true
+                            cancelLong()
+                        }
+                        if (moved && !longFired) {
                             p.x = (sX + dx).toInt().coerceIn(0, screenW - orbSize)
                             p.y = (sY + dy).toInt().coerceIn(0, screenH - orbSize)
                             try { wm.updateViewLayout(o, p) } catch (_: Throwable) {}
@@ -126,7 +139,18 @@ class OverlayController(private val ctx: Context) {
                         true
                     }
                     MotionEvent.ACTION_UP -> {
-                        if (moved) snapToEdge() else onOrbTap()
+                        cancelLong()
+                        if (longFired) {
+                            // কিছু না, বন্ধ বাটন দেখানো হয়েছে
+                        } else if (moved) {
+                            snapToEdge()
+                        } else {
+                            onOrbTap()
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        cancelLong()
                         true
                     }
                     else -> false
@@ -141,15 +165,41 @@ class OverlayController(private val ctx: Context) {
 
     fun stop() {
         alive = false
+        cancelLong()
         main.removeCallbacksAndMessages(null)
         removeBubbleWindow()
         hideThinkPill()
+        hideClosePill()
         val o = orb
         if (o != null) {
             try { wm.removeView(o) } catch (_: Throwable) {}
         }
         orb = null
         orbLp = null
+    }
+
+    // অ্যাপ থেকে আসা কাজ
+    fun runTask(text: String) {
+        main.post { if (alive) runText(text, true) }
+    }
+
+    private fun scheduleLong(v: View) {
+        cancelLong()
+        val r = Runnable {
+            if (!moved && alive) {
+                longFired = true
+                try { v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Throwable) {}
+                showClosePill()
+            }
+        }
+        longRun = r
+        main.postDelayed(r, 2000)
+    }
+
+    private fun cancelLong() {
+        val r = longRun
+        if (r != null) main.removeCallbacks(r)
+        longRun = null
     }
 
     private fun snapToEdge() {
@@ -314,8 +364,9 @@ class OverlayController(private val ctx: Context) {
         val r = root ?: return
         if (!alive) return
         removeBubbleWindow()
-        answerText.text = lastAnswer
-        answerScroll.visibility = if (lastAnswer.isEmpty()) View.GONE else View.VISIBLE
+        val last = ChatStore.lastAi()
+        answerText.text = last
+        answerScroll.visibility = if (last.isEmpty()) View.GONE else View.VISIBLE
         inputRow.visibility = if (inputMode) View.VISIBLE else View.GONE
         try {
             wm.addView(r, bubbleParams(inputMode))
@@ -353,20 +404,21 @@ class OverlayController(private val ctx: Context) {
         input.setText("")
         removeBubbleWindow()
         mode = 0
+        runText(t, false)
+    }
+
+    private fun runText(t: String, isTask: Boolean) {
+        removeBubbleWindow()
+        mode = 0
         thinking = true
         orb?.thinking = true
         showThinkPill()
-        Brain.ask(ctx, t) { reply ->
-            main.post {
-                if (alive) {
-                    thinking = false
-                    orb?.thinking = false
-                    hideThinkPill()
-                    if (reply.show) {
-                        lastAnswer = reply.text
-                        showBubble(false)
-                    }
-                }
+        Agent.handle(ctx, t, isTask) { reply ->
+            if (alive) {
+                thinking = false
+                orb?.thinking = false
+                hideThinkPill()
+                if (reply.show) showBubble(false)
             }
         }
     }
@@ -411,5 +463,56 @@ class OverlayController(private val ctx: Context) {
         val p = thinkPill ?: return
         try { wm.removeView(p) } catch (_: Throwable) {}
         thinkPill = null
+    }
+
+    // ২ সেকেন্ড চেপে ধরলে "বন্ধ করুন" বাটন
+    private fun showClosePill() {
+        hideClosePill()
+        val lp0 = orbLp ?: return
+        val tv = TextView(ctx).apply {
+            text = "✕  বন্ধ করুন"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#DC2626"))
+                cornerRadius = dp(22).toFloat()
+            }
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+            setOnClickListener {
+                hideClosePill()
+                onCloseRequest()
+            }
+        }
+        val lp = WLP(
+            WLP.WRAP_CONTENT, WLP.WRAP_CONTENT,
+            WLP.TYPE_APPLICATION_OVERLAY,
+            WLP.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        val w = dp(140)
+        val onRight = lp0.x > screenW / 2
+        lp.x = (if (onRight) lp0.x - w - dp(8) else lp0.x + orbSize + dp(8)).coerceAtLeast(0)
+        lp.y = lp0.y + (orbSize - dp(44)) / 2
+        try {
+            wm.addView(tv, lp)
+            closePill = tv
+        } catch (_: Throwable) {
+            return
+        }
+        val h = Runnable { hideClosePill() }
+        closeHide = h
+        main.postDelayed(h, 4000)
+    }
+
+    private fun hideClosePill() {
+        val h = closeHide
+        if (h != null) main.removeCallbacks(h)
+        closeHide = null
+        val p = closePill ?: return
+        try { wm.removeView(p) } catch (_: Throwable) {}
+        closePill = null
     }
 }
